@@ -13,8 +13,8 @@ from collections import defaultdict
 from torchvision.transforms import v2
 from typing import Any, Generator, List
 
-from models.himot import build_himot
-from models.himot import build_td_criterion
+from models.deformable_detr.deformable_detr import build as build_deformable_detr
+from structures.args import Args
 from runtime_option import runtime_option
 from utils.misc import yaml_to_dict, set_seed
 from configs.util import load_super_config, update_config
@@ -23,8 +23,9 @@ from data import build_dataset
 from data.naive_sampler import NaiveSampler
 from data.util import collate_fn
 from log.log import TPS, Metrics
-from models.misc import load_detr_pretrain, save_checkpoint, load_checkpoint
+from models.misc import save_checkpoint, load_checkpoint
 from models.misc import get_model
+from models.mttr import ROIEncoder, TrajEncoder, TrackBank
 from utils.nested_tensor import NestedTensor
 from submit_and_evaluate import submit_and_evaluate_one_model
 
@@ -78,11 +79,20 @@ def train_engine(config: dict):
         length_per_iteration=config["LENGTH_PER_ITERATION"],
         data_weights=data_weights,
     )
+    debug_sanity = config.get("DEBUG_SANITY", False)
+    debug_max_iters = config.get("DEBUG_SANITY_ITERS", 5)
+    if debug_sanity:
+        debug_max_iters = max(1, min(int(debug_max_iters), 50))
+        logger.warning(
+            log=f"DEBUG_SANITY enabled: logging first {debug_max_iters} iterations."
+        )
+
     # Build training data loader:
+    batch_size = config["BATCH_SIZE"]
     train_dataloader = DataLoader(
         dataset=train_dataset,
         sampler=train_sampler,
-        batch_size=config["BATCH_SIZE"],
+        batch_size=batch_size,
         num_workers=config["NUM_WORKERS"],
         prefetch_factor=config["PREFETCH_FACTOR"] if config["NUM_WORKERS"] > 0 else None,
         collate_fn=collate_fn,
@@ -95,24 +105,42 @@ def train_engine(config: dict):
         "global_step": 0
     }
 
-    # Build HiMOT model:
-    model, detr_criterion = build_himot(config=config)
+    # Build MTTR model (DETR-only) and attach encoders:
+    model, detr_criterion = build_detr_only(config=config)
+    model.roi_encoder = ROIEncoder(
+        hidden_dim=config.get("DETR_HIDDEN_DIM", 256),
+        pool_size=config.get("MTTR_ROI_POOL_SIZE", 7),
+        num_layers=config.get("MTTR_ROI_NUM_LAYERS", 2),
+        nhead=config.get("MTTR_ROI_NHEAD", 8),
+        dropout=config.get("MTTR_ROI_DROPOUT", 0.0),
+    )
+    model.traj_encoder = TrajEncoder(
+        hidden_dim=config.get("DETR_HIDDEN_DIM", 256),
+        traj_len=config.get("MTTR_TRAJ_LEN", 30),
+        num_layers=config.get("MTTR_TRAJ_NUM_LAYERS", 6),
+        nhead=config.get("MTTR_TRAJ_NHEAD", 8),
+        dim_feedforward=config.get("MTTR_TRAJ_FFN_DIM", 1024),
+        dropout=config.get("MTTR_TRAJ_DROPOUT", 0.0),
+        norm_first=config.get("MTTR_TRAJ_NORM_FIRST", True),
+    )
+    if config.get("MTTR_MAX_TRACKS", 100) > config.get("DETR_NUM_QUERIES", 300):
+        raise ValueError("MTTR_MAX_TRACKS must be <= DETR_NUM_QUERIES.")
     # Load the pre-trained DETR:
-    load_detr_pretrain(
-        model=model, pretrain_path=config["DETR_PRETRAIN"], num_classes=config["NUM_CLASSES"],
-        default_class_idx=config["DETR_DEFAULT_CLASS_IDX"] if "DETR_DEFAULT_CLASS_IDX" in config else None,
+    load_detr_pretrain_for_detr(
+        model=model,
+        pretrain_path=config["DETR_PRETRAIN"],
+        num_classes=config["NUM_CLASSES"],
+        default_class_idx=config.get("DETR_DEFAULT_CLASS_IDX", None),
     )
     logger.success(
         log=f"Load the pre-trained DETR from '{config['DETR_PRETRAIN']}'. "
     )
-    # Build Loss Function:
-    td_criterion = build_td_criterion(config=config)
 
     # Build Optimizer:
     if config["DETR_NUM_TRAIN_FRAMES"] == 0:
         for n, p in model.named_parameters():
             if "detr" in n:
-                p.requires_grad = False     # only train the HiMOT part.
+                p.requires_grad = False     # Freeze DETR params if configured.
     param_groups = get_param_groups(model, config)
     optimizer = AdamW(
         params=param_groups,
@@ -126,7 +154,7 @@ def train_engine(config: dict):
     )
 
     # Other infos:
-    only_detr = config["ONLY_DETR"]
+    only_detr = False
 
     # Resuming:
     if config["RESUME_MODEL"] is not None:
@@ -170,16 +198,10 @@ def train_engine(config: dict):
             dataloader=train_dataloader,
             model=model,
             detr_criterion=detr_criterion,
-            td_criterion=td_criterion,
             optimizer=optimizer,
-            only_detr=only_detr,
             config=config,
             lr_warmup_epochs=config["LR_WARMUP_EPOCHS"],
             lr_warmup_tgt_lr=config["LR"],
-            detr_num_train_frames=config["DETR_NUM_TRAIN_FRAMES"],
-            detr_num_checkpoint_frames=config["DETR_NUM_CHECKPOINT_FRAMES"],
-            detr_criterion_batch_len=config.get("DETR_CRITERION_BATCH_LEN", 10),
-            use_decoder_checkpoint=config["USE_DECODER_CHECKPOINT"],
             accumulate_steps=config["ACCUMULATE_STEPS"],
             separate_clip_norm=config.get("SEPARATE_CLIP_NORM", True),
             max_clip_norm=config.get("MAX_CLIP_NORM", 0.1),
@@ -239,6 +261,10 @@ def train_engine(config: dict):
                     area_thresh=config.get("AREA_THRESH", 0),
                     inference_only_detr=config["INFERENCE_ONLY_DETR"] if config["INFERENCE_ONLY_DETR"] is not None
                     else config["ONLY_DETR"],
+                    mttr_max_tracks=config.get("MTTR_MAX_TRACKS", 100),
+                    mttr_traj_len=config.get("MTTR_TRAJ_LEN", 30),
+                    mttr_max_miss=config.get("MTTR_MAX_MISS", config.get("MISS_TOLERANCE", 30)),
+                    mttr_hidden_dim=config.get("DETR_HIDDEN_DIM", 256),
                 )
                 eval_metrics.sync()
                 logger.metrics(
@@ -267,16 +293,10 @@ def train_one_epoch(
         dataloader: DataLoader,
         model,
         detr_criterion,
-        td_criterion,
         optimizer,
-        only_detr,
         config: dict,
         lr_warmup_epochs: int,
         lr_warmup_tgt_lr: float,
-        detr_num_train_frames: int,
-        detr_num_checkpoint_frames: int,
-        detr_criterion_batch_len: int,
-        use_decoder_checkpoint: bool,
         accumulate_steps: int = 1,
         separate_clip_norm: bool = True,
         max_clip_norm: float = 0.1,
@@ -290,13 +310,15 @@ def train_one_epoch(
     current_last_checkpoint_idx = 0
 
     model.train()
-    tps = TPS()     # time per step
+    model.roi_encoder.train()
+    model.traj_encoder.train()
+    tps = TPS()
     metrics = Metrics()
     optimizer.zero_grad()
     step_timestamp = tps.timestamp()
     device = accelerator.device
-    _B = dataloader.batch_sampler.batch_size
-    # Prepare for gradient clip norm:
+    detr_weight_dict = detr_criterion.weight_dict
+
     model_without_ddp = get_model(model)
     detr_params = []
     other_params = []
@@ -306,21 +328,76 @@ def train_one_epoch(
         else:
             other_params.append(param)
 
+    hidden_dim = config.get("DETR_HIDDEN_DIM", 256)
+    max_tracks = min(config.get("MTTR_MAX_TRACKS", 100), config.get("DETR_NUM_QUERIES", 300))
+    traj_len = config.get("MTTR_TRAJ_LEN", 30)
+    max_miss = config.get("MTTR_MAX_MISS", 30)
+    teacher_forcing = config.get("MTTR_TEACHER_FORCING", True)
+
+    debug_sanity = config.get("DEBUG_SANITY", False)
+    debug_assert = config.get("DEBUG_ASSERT", False)
+    debug_max_iters = None
+    if debug_sanity:
+        debug_max_iters = max(1, min(int(config.get("DEBUG_SANITY_ITERS", 5)), 50))
+
+    def _debug_log_lookup(tag: str, masks_label: torch.Tensor, annidx_label: torch.Tensor, enabled: bool):
+        if not enabled:
+            return
+        num_labels = int(masks_label.numel())
+        num_visible = int((~masks_label).sum().item()) if num_labels > 0 else 0
+        num_missing = int(masks_label.sum().item()) if num_labels > 0 else 0
+        num_ann_valid = int((annidx_label >= 0).sum().item()) if num_labels > 0 else 0
+        samples = []
+        if num_labels > 0:
+            perm = torch.randperm(num_labels, device=masks_label.device)[:min(3, num_labels)]
+            for idx in perm.tolist():
+                samples.append((int(idx), bool(masks_label[idx].item()), int(annidx_label[idx].item())))
+        logger.info(
+            log=(
+                f"[DEBUG_SANITY] {tag} valid_labels={num_labels} visible={num_visible} "
+                f"missing={num_missing} ann_valid={num_ann_valid} sample={samples}"
+            )
+        )
+
+    def _debug_log_gt_to_label(tag: str, ann: dict, masks_label: torch.Tensor, annidx_label: torch.Tensor, enabled: bool):
+        if not enabled:
+            return
+        if "id" not in ann:
+            logger.info(log=f"[DEBUG_SANITY] {tag} gt2label=missing_ann_id")
+            return
+        ann_ids = ann["id"]
+        if torch.is_tensor(ann_ids):
+            ann_ids = ann_ids.tolist()
+        num_gt = len(ann_ids)
+        label_for_ann = [-1 for _ in range(num_gt)]
+        mask_for_ann = [None for _ in range(num_gt)]
+        num_labels = int(annidx_label.numel())
+        for label in range(num_labels):
+            ann_idx = int(annidx_label[label].item())
+            if ann_idx < 0 or ann_idx >= num_gt:
+                continue
+            if label_for_ann[ann_idx] != -1 and debug_assert:
+                raise AssertionError(
+                    f"ann_idx {ann_idx} mapped to multiple labels: "
+                    f"{label_for_ann[ann_idx]} and {label}"
+                )
+            label_for_ann[ann_idx] = label
+            mask_for_ann[ann_idx] = bool(masks_label[label].item())
+        mapping = [(int(ann_ids[i]), int(label_for_ann[i]), mask_for_ann[i]) for i in range(num_gt)]
+        logger.info(log=f"[DEBUG_SANITY] {tag} gt2label={mapping}")
+
+
+
     for step, samples in enumerate(dataloader):
         images, annotations, metas = samples["images"], samples["annotations"], samples["metas"]
-        # Normalize the images:
-        # (Normally, it should be done in the dataloader, but here we do it in the training loop (on cuda).)
         mean = [0.485, 0.456, 0.406]
         std = [0.229, 0.224, 0.225]
         images.tensors = v2.functional.to_dtype(images.tensors, dtype=torch.float32, scale=True)
         images.tensors = v2.functional.normalize(images.tensors, mean=mean, std=std)
-        # A hack implementation to recover 0.0 in the masked regions:
         images.tensors = images.tensors * (~images.mask[:, :, None, ...]).to(torch.float32)
         images.tensors = images.tensors.contiguous()
 
-        # Learning rate warmup:
         if epoch < lr_warmup_epochs:
-            # Do warmup:
             lr_warmup(
                 optimizer=optimizer,
                 epoch=epoch, curr_iter=step, tgt_lr=lr_warmup_tgt_lr,
@@ -328,137 +405,286 @@ def train_one_epoch(
             )
 
         _B, _T = len(annotations), len(annotations[0])
-        detr_num_train_frames = min(detr_num_train_frames, _T)
+        if _T == 1:
+            t = 0
+        else:
+            t = int(torch.randint(1, _T, (1,), device=device).item())
 
-        # Prepare the DETR targets from the annotations:
-        detr_targets_flatten = annotations_to_flatten_detr_targets(annotations=annotations, device=device)
+        group_indices = []
+        for b in range(_B):
+            g_total = annotations[b][0]["trajectory_id_labels"].shape[0]
+            g = int(torch.randint(0, g_total, (1,), device=device).item())
+            group_indices.append(g)
 
-        # Select the training and no_grad frames:
-        random_frame_idxs = torch.randperm(_T, device=device)   # use these random indices to select the frames.
-        go_back_frame_idxs = torch.argsort(random_frame_idxs)   # use these indices to go back to the original order.
-        go_back_frame_idxs_flatten = torch.cat([
-            go_back_frame_idxs + _T * b for b in range(_B)
-        ])      # only used for the DETR's criterion.
-        # Split random_frame_idxs into training and no_grad frame indices:
-        detr_train_frame_idxs = random_frame_idxs[:detr_num_train_frames]
-        detr_no_grad_frame_idxs = random_frame_idxs[detr_num_train_frames:]
+        debug_log_enabled = debug_sanity and (debug_max_iters is None or step < debug_max_iters)
 
-        detr_outputs_flatten_idxs = torch.arange(_B * _T, device=device)
-        detr_outputs_flatten_idxs = einops.rearrange(detr_outputs_flatten_idxs, "(b t) -> b t", b=_B)
-        detr_outputs_flatten_idxs = torch.cat([
-            einops.rearrange(detr_outputs_flatten_idxs[:, :detr_num_train_frames], "b t -> (b t)"),
-            einops.rearrange(detr_outputs_flatten_idxs[:, detr_num_train_frames:], "b t -> (b t)"),
-        ], dim=0)
-        detr_outputs_flatten_go_back_idxs = torch.argsort(detr_outputs_flatten_idxs)
-        pass
-        # Select the training and no_grad frames:
-        detr_train_frames = nested_tensor_index_select(images, dim=1, index=detr_train_frame_idxs)
-        detr_no_grad_frames = nested_tensor_index_select(images, dim=1, index=detr_no_grad_frame_idxs)
+        if debug_log_enabled:
+            step_meta = []
+            for b in range(_B):
+                meta_list = metas[b]
+                dataset = meta_list[0].get("dataset", "unknown")
+                split = meta_list[0].get("split", "")
+                sequence = meta_list[0].get("sequence", "")
+                frame_idxs = [m.get("frame_idx", None) for m in meta_list]
+                train_frame_idx = frame_idxs[t] if t < len(frame_idxs) else None
+                prefix_frame_idxs = frame_idxs[:t]
+                step_meta.append({
+                    "dataset": dataset,
+                    "split": split,
+                    "sequence": sequence,
+                    "frames": frame_idxs,
+                    "train_frame": train_frame_idx,
+                    "prefix": prefix_frame_idxs,
+                })
+            logger.info(log=f"[DEBUG_SANITY] step={step} data={step_meta}")
 
-        # Prepare for the DETR forward function, turn the (B, T, ...) images to (B*T, ...) (or said flatten):
-        detr_train_frames.tensors = einops.rearrange(detr_train_frames.tensors, "b t c h w -> (b t) c h w").contiguous()
-        detr_train_frames.mask = einops.rearrange(detr_train_frames.mask, "b t h w -> (b t) h w").contiguous()
-        detr_no_grad_frames.tensors = einops.rearrange(detr_no_grad_frames.tensors, "b t c h w -> (b t) c h w").contiguous()
-        detr_no_grad_frames.mask = einops.rearrange(detr_no_grad_frames.mask, "b t h w -> (b t) h w").contiguous()
+        track_banks = [
+            TrackBank(
+                traj_len=traj_len,
+                hidden_dim=hidden_dim,
+                max_miss=max_miss,
+                device=device,
+                dtype=images.tensors.dtype,
+            )
+            for _ in range(_B)
+        ]
 
-        # TODO: For DeNoise (e.g., in DINO-DETR),
-        #       need to split the detr_targets_flatten into training and no_grad parts.
-
-        # DETR forward:
-        # 1. no_grad frames:
-        if _T > detr_num_train_frames:      # do have no_grad frames (if not, skip this part)
+        if t > 0 and teacher_forcing:
+            prefix_tensors = images.tensors[:, :t]
+            prefix_masks = images.mask[:, :t]
+            prefix_tensors = einops.rearrange(prefix_tensors, "b t c h w -> (b t) c h w").contiguous()
+            prefix_masks = einops.rearrange(prefix_masks, "b t h w -> (b t) h w").contiguous()
+            prefix_nested = NestedTensor(prefix_tensors, prefix_masks)
             with torch.no_grad():
-                if detr_num_checkpoint_frames == 0 or detr_num_checkpoint_frames * 4 >= len(detr_no_grad_frames):
-                    # Directly forward the no_grad frames:
-                    detr_no_grad_outputs = model(frames=detr_no_grad_frames, part="detr")
-                else:
-                    # Split the no_grad frames into batched iterations (reduce the memory usage):
-                    detr_no_grad_outputs = None
-                    for batch_samples in batch_iterator(
-                        detr_num_checkpoint_frames * 4,
-                        detr_no_grad_frames,
-                    ):
-                        batch_frames = batch_samples[0]
-                        _ = model(frames=batch_frames, part="detr")
-                        detr_no_grad_outputs = tensor_dict_cat(detr_no_grad_outputs, _, dim=0)
-        else:                               # no no_grad frames
-            detr_no_grad_outputs = None
+                out_prefix = model(samples=prefix_nested)
+            feat_highres = out_prefix["feat_highres"]
+            feat_highres = einops.rearrange(feat_highres, "(b t) c h w -> b t c h w", b=_B, t=t)
 
-        # 2. training frames:
-        if detr_num_train_frames > 0:
-            if detr_num_checkpoint_frames == 0 or detr_num_checkpoint_frames >= len(detr_train_frames):
-                # Directly forward the training frames:
-                detr_train_outputs = model(frames=detr_train_frames, part="detr")
-            else:
-                # Split the training frames into batched iterations (reduce the memory usage):
-                detr_train_outputs = None
-                for batch_samples in batch_iterator(
-                    detr_num_checkpoint_frames,
-                    detr_train_frames,
-                ):
-                    batch_frames = batch_samples[0]
-                    _ = model(frames=batch_frames, part="detr", use_checkpoint=True)
-                    detr_train_outputs = tensor_dict_cat(detr_train_outputs, _, dim=0)
-        else:
-            detr_train_outputs = None
+            for tau in range(t):
+                feat_tau = feat_highres[:, tau]
+                nmax = annotations[0][tau]["trajectory_id_labels"].shape[-1]
+                boxes_override = feat_tau.new_zeros((_B, nmax, 4))
+                keep_mask = torch.zeros((_B, nmax), dtype=torch.bool, device=device)
 
-        # Combine training and no_grad outputs:
-        detr_outputs = tensor_dict_cat(detr_train_outputs, detr_no_grad_outputs, dim=0)
-        # Recover the order of the outputs:
-        detr_outputs = tensor_dict_index_select(detr_outputs, index=detr_outputs_flatten_go_back_idxs, dim=0)
-        detr_outputs = tensor_dict_index_select(detr_outputs, index=go_back_frame_idxs_flatten, dim=0)
+                for b in range(_B):
+                    masks_label, annidx_label = _build_label_lookup(
+                        ann=annotations[b][tau],
+                        group_idx=group_indices[b],
+                        device=device,
+                        time_idx=tau,
+                        debug_assert=debug_assert,
+                    )
+                    if debug_log_enabled and b == 0:
+                        _debug_log_lookup(
+                            tag=f"lookup prefix tau={tau} g={group_indices[b]}",
+                            masks_label=masks_label,
+                            annidx_label=annidx_label,
+                            enabled=debug_log_enabled,
+                        )
+                        _debug_log_gt_to_label(
+                            tag=f"gt2label prefix tau={tau} g={group_indices[b]}",
+                            ann=annotations[b][tau],
+                            masks_label=masks_label,
+                            annidx_label=annidx_label,
+                            enabled=debug_log_enabled,
+                        )
+                    visible = (~masks_label) & (annidx_label >= 0)
+                    active_labels = track_banks[b].get_active_labels()
+                    for label in active_labels:
+                        if label >= visible.numel() or not visible[label].item():
+                            track_banks[b].push_miss(label)
 
-        # DETR criterion:
-        detr_loss_dict, detr_indices = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
-        # Whether to only train the DETR, OR to train the TD together:
-        if not only_detr:
-            seq_info = prepare_for_himot(
-                detr_outputs=detr_outputs,
-                annotations=annotations,
-                detr_indices=detr_indices,
-                config=config,
-            )
-            td_out = model(seq_info=seq_info, part="traj_decoder")
-            td_loss_dict = td_criterion(
-                pred_emb=td_out["pred_emb"],
-                pred_box=td_out["pred_box"],
-                tgt_emb=seq_info["tgt_emb"],
-                tgt_box=seq_info["tgt_box"],
-                valid_targets_mask=seq_info["valid_tgt"],
-            )
-        else:
-            zero = detr_outputs["pred_logits"].new_tensor(0.0)
-            td_loss_dict = {
-                "loss_td_emb": zero,
-                "loss_td_box": zero,
-                "loss_td_total": zero,
-            }
+                    if visible.numel() > 0:
+                        ann_bbox = annotations[b][tau]["bbox"].to(device=device, dtype=feat_tau.dtype)
+                        visible_idx = torch.nonzero(visible, as_tuple=False).flatten()
+                        for label in visible_idx.tolist():
+                            ann_idx = int(annidx_label[label].item())
+                            boxes_override[b, label] = ann_bbox[ann_idx]
+                            keep_mask[b, label] = True
 
-        # Backward:
+                if keep_mask.any():
+                    with torch.no_grad():
+                        roi_feats, roi_indices = model.roi_encoder(
+                            feat_highres=feat_tau,
+                            boxes=boxes_override,
+                            keep_mask=keep_mask,
+                        )
+                    roi_feats = roi_feats.detach()
+                    for k in range(roi_indices.shape[0]):
+                        b = int(roi_indices[k, 0].item())
+                        label = int(roi_indices[k, 1].item())
+                        track_banks[b].ensure_track(label)
+                        track_banks[b].push_roi(label, roi_feats[k])
+
+        track_queries_batch = images.tensors.new_zeros((_B, max_tracks, hidden_dim))
+        slot_label_ids = torch.full((_B, max_tracks), -1, device=device, dtype=torch.long)
+        k_per_b = [0 for _ in range(_B)]
+        for b in range(_B):
+            active_labels = track_banks[b].get_active_labels()
+            labels_use = sorted(active_labels)[:max_tracks]
+            k_per_b[b] = len(labels_use)
+            if len(labels_use) == 0:
+                continue
+            traj_batch, pad_mask_batch = track_banks[b].export_batch(labels_use)
+            with accelerator.autocast():
+                queries = model.traj_encoder(traj_batch, pad_mask_batch)
+            track_queries_batch[b, :len(labels_use)] = queries
+            slot_label_ids[b, :len(labels_use)] = torch.tensor(labels_use, device=device, dtype=torch.long)
+
+        train_frame = NestedTensor(images.tensors[:, t], images.mask[:, t])
         with accelerator.autocast():
-            detr_weight_dict = detr_criterion.weight_dict
-            detr_loss = sum(
-                detr_loss_dict[k] * detr_weight_dict[k] for k in detr_loss_dict.keys() if k in detr_weight_dict
+            out_t = model(samples=train_frame, track_queries=track_queries_batch)
+        pred_logits = out_t["pred_logits"].float()
+        pred_boxes = out_t["pred_boxes"].float()
+
+        logits_track = pred_logits[:, :max_tracks, :]
+        boxes_track = pred_boxes[:, :max_tracks, :]
+
+        targets_track = []
+        indices_track = []
+        total_boxes = 0
+        num_pos_per_b = [0 for _ in range(_B)]
+        num_gt_per_b = [0 for _ in range(_B)]
+        for b in range(_B):
+            masks_label, annidx_label = _build_label_lookup(
+                ann=annotations[b][t],
+                group_idx=group_indices[b],
+                device=device,
+                time_idx=t,
+                debug_assert=debug_assert,
             )
-            loss = detr_loss + td_loss_dict["loss_td_total"]
-            # Logging losses:
-            metrics.update(name="loss", value=loss.item())
-            metrics.update(name="detr_loss", value=detr_loss.item())
-            metrics.update(name="loss_td_total", value=td_loss_dict["loss_td_total"].item())
-            metrics.update(name="loss_td_emb", value=td_loss_dict["loss_td_emb"].item())
-            if "loss_td_emb_cos" in td_loss_dict:
-                metrics.update(name="loss_td_emb_cos", value=td_loss_dict["loss_td_emb_cos"].item())
-            if "loss_td_emb_mse" in td_loss_dict:
-                metrics.update(name="loss_td_emb_mse", value=td_loss_dict["loss_td_emb_mse"].item())
-            metrics.update(name="loss_td_box", value=td_loss_dict["loss_td_box"].item())
-            if "loss_td_box_l1" in td_loss_dict:
-                metrics.update(name="loss_td_box_l1", value=td_loss_dict["loss_td_box_l1"].item())
-            if "loss_td_box_giou" in td_loss_dict:
-                metrics.update(name="loss_td_box_giou", value=td_loss_dict["loss_td_box_giou"].item())
-            for k, v in detr_loss_dict.items():
-                metrics.update(name=k, value=v.item())
-            loss /= accumulate_steps
-            accelerator.backward(loss)  # use this line to replace loss.backward()
+            if debug_log_enabled and b == 0:
+                _debug_log_lookup(
+                    tag=f"lookup t={t} g={group_indices[b]}",
+                    masks_label=masks_label,
+                    annidx_label=annidx_label,
+                    enabled=debug_log_enabled,
+                )
+                _debug_log_gt_to_label(
+                    tag=f"gt2label t={t} g={group_indices[b]}",
+                    ann=annotations[b][t],
+                    masks_label=masks_label,
+                    annidx_label=annidx_label,
+                    enabled=debug_log_enabled,
+                )
+            ann = annotations[b][t]
+            ann_bbox = ann["bbox"].to(device=device, dtype=pred_boxes.dtype)
+            ann_category = ann["category"].to(device=device, dtype=torch.int64)
+            if debug_assert:
+                if ann_bbox.ndim != 2 or ann_bbox.shape[1] != 4:
+                    raise AssertionError(f"ann_bbox shape invalid: {ann_bbox.shape}")
+            num_gt_per_b[b] = int(ann_bbox.shape[0])
+            pos_mask = (~masks_label) & (annidx_label >= 0)
+            src_idx = []
+            tgt_labels = []
+            tgt_boxes = []
+            for i in range(max_tracks):
+                label = int(slot_label_ids[b, i].item())
+                if label < 0 or label >= pos_mask.numel():
+                    continue
+                if pos_mask[label].item():
+                    ann_idx = int(annidx_label[label].item())
+                    if debug_assert:
+                        if ann_idx < 0 or ann_idx >= ann_bbox.shape[0]:
+                            raise AssertionError(
+                                f"ann_idx {ann_idx} out of range [0, {ann_bbox.shape[0]}) for label {label}"
+                            )
+                    src_idx.append(i)
+                    tgt_labels.append(ann_category[ann_idx])
+                    tgt_boxes.append(ann_bbox[ann_idx])
+
+            num_pos_per_b[b] = len(src_idx)
+            if len(tgt_labels) == 0:
+                targets_track.append({
+                    "labels": ann_category.new_zeros((0,), dtype=torch.int64),
+                    "boxes": ann_bbox.new_zeros((0, 4)),
+                })
+                empty = torch.zeros((0,), dtype=torch.int64, device=device)
+                indices_track.append((empty, empty))
+            else:
+                targets_track.append({
+                    "labels": torch.stack(tgt_labels, dim=0),
+                    "boxes": torch.stack(tgt_boxes, dim=0),
+                })
+                src_idx_tensor = torch.tensor(src_idx, dtype=torch.int64, device=device)
+                tgt_idx_tensor = torch.arange(len(src_idx), dtype=torch.int64, device=device)
+                indices_track.append((src_idx_tensor, tgt_idx_tensor))
+                total_boxes += len(src_idx)
+
+        num_boxes = max(1, total_boxes)
+
+        def _compute_track_losses(pred_logits, pred_boxes, add_suffix: str | None = None):
+            pred_logits = pred_logits.float()
+            pred_boxes = pred_boxes.float()
+            outputs_track = {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
+            losses = detr_criterion.loss_labels(
+                outputs_track,
+                targets_track,
+                indices_track,
+                num_boxes,
+                log=True,
+            )
+            if total_boxes > 0:
+                losses.update(detr_criterion.loss_boxes(
+                    outputs_track,
+                    targets_track,
+                    indices_track,
+                    num_boxes,
+                ))
+            else:
+                zero = pred_boxes.new_tensor(0.0)
+                losses.update({"loss_bbox": zero, "loss_giou": zero})
+            losses.update(detr_criterion.loss_cardinality(
+                outputs_track,
+                targets_track,
+                indices_track,
+                num_boxes,
+            ))
+            if add_suffix is None:
+                return losses
+            return {f"{k}_{add_suffix}": v for k, v in losses.items()}
+
+        loss_dict = _compute_track_losses(logits_track, boxes_track)
+
+        if "aux_outputs" in out_t:
+            for i, aux in enumerate(out_t["aux_outputs"]):
+                aux_logits = aux["pred_logits"][:, :max_tracks, :]
+                aux_boxes = aux["pred_boxes"][:, :max_tracks, :]
+                loss_dict.update(_compute_track_losses(aux_logits, aux_boxes, add_suffix=str(i)))
+
+        with accelerator.autocast():
+            loss = sum(
+                loss_dict[k] * detr_weight_dict[k]
+                for k in loss_dict.keys()
+                if k in detr_weight_dict
+            )
+            loss_total_value = loss.item()
+            if debug_log_enabled:
+                loss_ce_val = loss_dict.get("loss_ce", loss.new_tensor(0.0)).item()
+                loss_bbox_val = loss_dict.get("loss_bbox", loss.new_tensor(0.0)).item()
+                loss_giou_val = loss_dict.get("loss_giou", loss.new_tensor(0.0)).item()
+                logger.info(
+                    log=(
+                        f"[DEBUG_SANITY] step={step} t={t} g={group_indices} "
+                        f"K={k_per_b} num_pos={num_pos_per_b} num_gt={num_gt_per_b} "
+                        f"num_pos_total={total_boxes} "
+                        f"loss_ce={loss_ce_val:.4f} loss_bbox={loss_bbox_val:.4f} "
+                        f"loss_giou={loss_giou_val:.4f} loss_total={loss_total_value:.4f} "
+                        f"pred_logits_dtype={pred_logits.dtype} pred_boxes_dtype={pred_boxes.dtype}"
+                    )
+                )
+            metrics.update(name="loss", value=loss_total_value)
+            for key in loss_dict.keys():
+                if key.startswith((
+                    "loss_ce",
+                    "loss_bbox",
+                    "loss_giou",
+                    "class_error",
+                    "cardinality_error",
+                )):
+                    metrics.update(name=key, value=loss_dict[key].item())
+            loss = loss / accumulate_steps
+            accelerator.backward(loss)
             if (step + 1) % accumulate_steps == 0:
                 if use_accelerate_clip_norm:
                     if separate_clip_norm:
@@ -474,35 +700,25 @@ def train_one_epoch(
                     else:
                         accelerator.unscale_gradients()
                         detr_grad_norm = other_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_clip_norm)
-                # Hack implementation to log grad_norm
                 metrics.update(name="detr_grad_norm", value=detr_grad_norm.item())
                 metrics.update(name="other_grad_norm", value=other_grad_norm.item())
                 optimizer.step()
                 optimizer.zero_grad()
 
-        # Logging:
         tps.update(tps=tps.timestamp() - step_timestamp)
         step_timestamp = tps.timestamp()
-        # Logging:
         if step % logging_interval == 0:
-            # logger.info(f"[Epoch: {epoch}] [{step}/{total_steps}] [tps: {tps.average:.2f}s]")
-            # Get learning rate for current step:
             _lr = optimizer.state_dict()["param_groups"][-1]["lr"]
-            # Get the GPU memory usage:
             torch.cuda.synchronize()
             _cuda_memory = torch.cuda.max_memory_allocated(device) / 1024 / 1024
             _cuda_memory = torch.tensor([_cuda_memory], device=device)
-            # _cuda_memory_reduce = accelerator.reduce(_cuda_memory, reduction="none")
             _gathered_cuda_memory = accelerator.gather(_cuda_memory)
             _max_cuda_memory = _gathered_cuda_memory.max().item()
             accelerator.wait_for_everyone()
-            # Clear some values:
-            metrics["lr"].clear()  # clear the learning rate value from last step
+            metrics["lr"].clear()
             metrics["max_cuda_mem(MB)"].clear()
-            # Update them to the metrics:
             metrics.update(name="lr", value=_lr)
             metrics.update(name="max_cuda_mem(MB)", value=_max_cuda_memory)
-            # Sync the metrics:
             metrics.sync()
             eta = tps.eta(total_steps=len(dataloader), current_steps=step)
             logger.metrics(
@@ -511,7 +727,6 @@ def train_one_epoch(
                 metrics=metrics,
                 global_step=states["global_step"],
             )
-        # For multi last checkpoints:
         if is_last_epochs and multi_last_checkpoints > 0:
             if (step + 1) == int(math.ceil((len(dataloader) / multi_last_checkpoints) * (current_last_checkpoint_idx + 1))):
                 _dir = os.path.join(outputs_dir, "multi_last_checkpoints")
@@ -522,16 +737,133 @@ def train_one_epoch(
                     states=states,
                     optimizer=None,
                     scheduler=None,
-                    only_detr=only_detr,
+                    only_detr=False,
                 )
                 logger.info(
                     log=f"Save the last checkpoint {current_last_checkpoint_idx} at step {step}."
                 )
                 current_last_checkpoint_idx += 1
-        # Update the counters:
+
+
         states["global_step"] += 1
     states["start_epoch"] += 1
     return metrics
+
+
+def build_detr_only(config: dict):
+    detr_args = Args()
+    detr_args.backbone = config["BACKBONE"]
+    detr_args.lr_backbone = config["LR"] * config["LR_BACKBONE_SCALE"]
+    detr_args.dilation = config["DILATION"]
+    detr_args.num_classes = config["NUM_CLASSES"]
+    detr_args.device = config["DEVICE"]
+    detr_args.num_queries = config["DETR_NUM_QUERIES"]
+    detr_args.num_feature_levels = config["DETR_NUM_FEATURE_LEVELS"]
+    detr_args.aux_loss = config["DETR_AUX_LOSS"]
+    detr_args.with_box_refine = config["DETR_WITH_BOX_REFINE"]
+    detr_args.two_stage = config["DETR_TWO_STAGE"]
+    detr_args.hidden_dim = config["DETR_HIDDEN_DIM"]
+    detr_args.masks = config["DETR_MASKS"]
+    detr_args.position_embedding = config["DETR_POSITION_EMBEDDING"]
+    detr_args.nheads = config["DETR_NUM_HEADS"]
+    detr_args.enc_layers = config["DETR_ENC_LAYERS"]
+    detr_args.dec_layers = config["DETR_DEC_LAYERS"]
+    detr_args.dim_feedforward = config["DETR_DIM_FEEDFORWARD"]
+    detr_args.dropout = config["DETR_DROPOUT"]
+    detr_args.dec_n_points = config["DETR_DEC_N_POINTS"]
+    detr_args.enc_n_points = config["DETR_ENC_N_POINTS"]
+    detr_args.cls_loss_coef = config["DETR_CLS_LOSS_COEF"]
+    detr_args.bbox_loss_coef = config["DETR_BBOX_LOSS_COEF"]
+    detr_args.giou_loss_coef = config["DETR_GIOU_LOSS_COEF"]
+    detr_args.focal_alpha = config["DETR_FOCAL_ALPHA"]
+    detr_args.set_cost_class = config["DETR_SET_COST_CLASS"]
+    detr_args.set_cost_bbox = config["DETR_SET_COST_BBOX"]
+    detr_args.set_cost_giou = config["DETR_SET_COST_GIOU"]
+    model, criterion, _ = build_deformable_detr(args=detr_args)
+    return model, criterion
+
+
+def load_detr_pretrain_for_detr(model, pretrain_path: str, num_classes: int | None, default_class_idx: int | None = None):
+    pretrain_model = torch.load(pretrain_path, map_location=lambda storage, loc: storage, weights_only=False)
+    pretrain_state_dict = pretrain_model["model"]
+    model_state_dict = model.state_dict()
+    transfer_state = {}
+    for k, v in pretrain_state_dict.items():
+        if "class_embed" in k:
+            if num_classes is None:
+                num_classes = len(v)
+            if len(v) == 91:
+                if num_classes == 1:
+                    if default_class_idx is None:
+                        v = v[1:2]
+                    else:
+                        v = v[default_class_idx:default_class_idx + 1]
+                else:
+                    raise NotImplementedError(f"Do not support detr pretrain loading for num_classes={num_classes}")
+            elif num_classes == len(v):
+                pass
+            else:
+                raise NotImplementedError(
+                    f"Pretrained detr has a class head for {len(v)} classes, "
+                    f"we do not support this pretrained model."
+                )
+        if "label_enc" in k:
+            if len(v) != len(model_state_dict.get(k, v)):
+                if len(model_state_dict.get(k, v)) == 2:
+                    v = torch.cat((v[1:2], v[91:92]), dim=0)
+                else:
+                    raise NotImplementedError(f"Do not implement the pretrain loading processing for num_classes={num_classes}")
+        if k in model_state_dict:
+            transfer_state[k] = v
+
+    model_state_dict.update(transfer_state)
+    model.load_state_dict(state_dict=model_state_dict, strict=True)
+    return
+
+
+def _build_label_lookup(ann: dict, group_idx: int, device: torch.device, time_idx: int | None = None, debug_assert: bool = False):
+    id_labels = ann["trajectory_id_labels"].to(device)
+    id_masks = ann["trajectory_id_masks"].to(device)
+    ann_idxs = ann["trajectory_ann_idxs"].to(device)
+
+    def _select_time(tensor: torch.Tensor, name: str) -> torch.Tensor:
+        if tensor.dim() == 3:
+            tensor = tensor[group_idx]
+            if tensor.dim() != 2:
+                raise ValueError(f"{name} must have shape (G, T, N).")
+            t_dim = tensor.shape[0]
+            if t_dim == 1:
+                return tensor[0]
+            if time_idx is None:
+                raise ValueError(f"{name} has T={t_dim} but time_idx is None.")
+            if time_idx < 0 or time_idx >= t_dim:
+                raise ValueError(f"time_idx {time_idx} out of range for {name} with T={t_dim}.")
+            return tensor[time_idx]
+        if tensor.dim() == 2:
+            return tensor[group_idx]
+        raise ValueError(f"{name} must have shape (G, T, N) or (G, N).")
+
+    id_labels = _select_time(id_labels, "trajectory_id_labels")
+    id_masks = _select_time(id_masks, "trajectory_id_masks")
+    ann_idxs = _select_time(ann_idxs, "trajectory_ann_idxs")
+    valid = id_labels >= 0
+    if valid.sum().item() == 0:
+        empty_mask = id_masks.new_zeros((0,), dtype=torch.bool)
+        empty_idx = ann_idxs.new_zeros((0,), dtype=torch.long)
+        return empty_mask, empty_idx
+    perm_v = id_labels[valid]
+    if debug_assert:
+        unique_count = torch.unique(perm_v).numel()
+        if unique_count != perm_v.numel():
+            raise AssertionError(
+                f"Duplicate label indices in trajectory_id_labels at time_idx={time_idx}, group={group_idx}."
+            )
+    inv = torch.argsort(perm_v)
+    masks_base = id_masks[valid]
+    annidx_base = ann_idxs[valid]
+    masks_label = masks_base[inv]
+    annidx_label = annidx_base[inv]
+    return masks_label, annidx_label
 
 
 def get_param_groups(model, config) -> list[dict]:
@@ -664,91 +996,6 @@ def tensor_dict_index_select(tensor_dict, index, dim=0):
         else:
             raise ValueError(f"Unsupported type {type(tensor_dict[k])} in the tensor dict index select.")
     return dict(res_tensor_dict)
-
-
-def prepare_for_himot(detr_outputs, annotations, detr_indices, config: dict):
-    _B, _T = len(annotations), len(annotations[0])
-    _G, _, _N = annotations[0][0]["trajectory_ann_idxs"].shape
-    _device = detr_outputs["track_emb"].device
-    _emb_dim = detr_outputs["track_emb"].shape[-1]
-    _history_len = config.get("TD_HISTORY_LEN", 30)
-
-    n_all = _B * _G * _N
-    track_seq = torch.zeros((n_all, _history_len, _emb_dim), dtype=torch.float32, device=_device)
-    bbox_seq = torch.zeros((n_all, _history_len, 4), dtype=torch.float32, device=_device)
-    pad_mask = torch.ones((n_all, _history_len), dtype=torch.bool, device=_device)
-    miss_mask = torch.zeros((n_all, _history_len), dtype=torch.bool, device=_device)
-    tgt_emb = torch.zeros((n_all, _emb_dim), dtype=torch.float32, device=_device)
-    tgt_box = torch.zeros((n_all, 4), dtype=torch.float32, device=_device)
-    valid_tgt = torch.zeros((n_all,), dtype=torch.bool, device=_device)
-
-    # Pre-compute embeddings aligned to GT order for each frame.
-    frame_emb_by_idx = [None] * (_B * _T)
-    for b in range(_B):
-        for t in range(_T):
-            flatten_idx = b * _T + t
-            src_idx, tgt_idx = detr_indices[flatten_idx]
-            if tgt_idx.numel() == 0:
-                continue
-            go_back = torch.argsort(tgt_idx)
-            matched_src = src_idx[go_back]
-            frame_emb_by_idx[flatten_idx] = detr_outputs["track_emb"][flatten_idx][matched_src]
-
-    # Select target time per clip.
-    t_targets = []
-    for b in range(_B):
-        if _T > 1:
-            t_targets.append(int(torch.randint(1, _T, (1,)).item()))
-        else:
-            t_targets.append(0)
-
-    for b in range(_B):
-        t_target = t_targets[b]
-        history_start = max(0, t_target - _history_len)
-        history_frames = list(range(history_start, t_target))
-        history_len = len(history_frames)
-        pad_len = _history_len - history_len
-
-        for g in range(_G):
-            for k in range(_N):
-                idx = (b * _G + g) * _N + k
-
-                for p in range(_history_len):
-                    if p < pad_len:
-                        continue
-                    t = history_frames[p - pad_len]
-                    ann_idx = int(annotations[b][t]["trajectory_ann_idxs"][g, 0, k].item())
-                    is_masked = bool(annotations[b][t]["trajectory_id_masks"][g, 0, k].item())
-                    if ann_idx == -1:
-                        continue
-                    pad_mask[idx, p] = False
-                    if is_masked:
-                        miss_mask[idx, p] = True
-                        continue
-
-                    frame_emb = frame_emb_by_idx[b * _T + t]
-                    if frame_emb is not None and ann_idx < frame_emb.shape[0]:
-                        track_seq[idx, p] = frame_emb[ann_idx]
-                    bbox_seq[idx, p] = annotations[b][t]["bbox"][ann_idx].to(_device)
-
-                ann_idx_t = int(annotations[b][t_target]["trajectory_ann_idxs"][g, 0, k].item())
-                is_masked_t = bool(annotations[b][t_target]["trajectory_id_masks"][g, 0, k].item())
-                frame_emb_t = frame_emb_by_idx[b * _T + t_target]
-                has_emb_t = frame_emb_t is not None and ann_idx_t != -1 and ann_idx_t < frame_emb_t.shape[0]
-                if ann_idx_t != -1 and not is_masked_t and has_emb_t:
-                    tgt_emb[idx] = frame_emb_t[ann_idx_t].detach()
-                    tgt_box[idx] = annotations[b][t_target]["bbox"][ann_idx_t].to(_device)
-                    valid_tgt[idx] = True
-
-    return {
-        "track_seq": track_seq,
-        "bbox_seq": bbox_seq,
-        "pad_mask": pad_mask,
-        "miss_mask": miss_mask,
-        "tgt_emb": tgt_emb,
-        "tgt_box": tgt_box,
-        "valid_tgt": valid_tgt,
-    }
 
 
 if __name__ == '__main__':

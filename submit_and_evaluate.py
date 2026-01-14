@@ -15,10 +15,11 @@ from configs.util import load_super_config, update_config
 from log.logger import Logger
 from data.joint_dataset import dataset_classes
 from data.seq_dataset import SeqDataset
-from models.runtime_tracker import RuntimeTracker
 from log.log import Metrics
-from models.himot import build_himot
+from models.deformable_detr.deformable_detr import build as build_deformable_detr
+from models.mttr import ROIEncoder, TrajEncoder, MTTRRuntimeTracker
 from models.misc import load_checkpoint
+from structures.args import Args
 
 
 def submit_and_evaluate(config: dict):
@@ -66,7 +67,7 @@ def submit_and_evaluate(config: dict):
     else:
         logger.info(f"Outputs dir '{outputs_dir}' created.")
 
-    model, _ = build_himot(config=config)
+    model = build_mttr_model(config=config)
 
     use_previous_checkpoint = config.get("USE_PREVIOUS_CHECKPOINT", False)
     if not use_previous_checkpoint:
@@ -103,6 +104,10 @@ def submit_and_evaluate(config: dict):
         inference_only_detr=config["INFERENCE_ONLY_DETR"] if config["INFERENCE_ONLY_DETR"] is not None
         else config["ONLY_DETR"],
         dtype=config.get("INFERENCE_DTYPE", "FP32"),
+        mttr_max_tracks=config.get("MTTR_MAX_TRACKS", 100),
+        mttr_traj_len=config.get("MTTR_TRAJ_LEN", 30),
+        mttr_max_miss=config.get("MTTR_MAX_MISS", config.get("MISS_TOLERANCE", 30)),
+        mttr_hidden_dim=config.get("DETR_HIDDEN_DIM", 256),
     )
 
     if metrics is not None:
@@ -144,6 +149,10 @@ def submit_and_evaluate_one_model(
         area_thresh: int = 0,
         inference_only_detr: bool = False,
         dtype: str = "FP32",
+        mttr_max_tracks: int = 100,
+        mttr_traj_len: int = 30,
+        mttr_max_miss: int = 30,
+        mttr_hidden_dim: int = 256,
 ):
     # Build the datasets:
     inference_dataset = dataset_classes[dataset](
@@ -202,19 +211,15 @@ def submit_and_evaluate_one_model(
         )
         # sequence_loader = accelerator.prepare(sequence_loader)
         sequence_wh = sequence_dataset.seq_hw()
-        runtime_tracker = RuntimeTracker(
+        runtime_tracker = MTTRRuntimeTracker(
             model=model,
             sequence_hw=sequence_wh,
-            use_sigmoid=use_sigmoid,
-            assignment_protocol=assignment_protocol,
-            miss_tolerance=miss_tolerance,
+            max_tracks=mttr_max_tracks,
+            traj_len=mttr_traj_len,
+            hidden_dim=mttr_hidden_dim,
+            miss_tolerance=mttr_max_miss,
             det_thresh=det_thresh,
             newborn_thresh=newborn_thresh,
-            id_thresh=id_thresh,
-            iou_thresh=iou_thresh,
-            emb_cos_weight=emb_cos_weight,
-            emb_mse_weight=emb_mse_weight,
-            iou_weight=iou_cost_weight,
             area_thresh=area_thresh,
             only_detr=inference_only_detr,
             dtype=dtype,
@@ -357,7 +362,7 @@ def submit_and_evaluate_one_model(
 @torch.no_grad()
 def get_results_of_one_sequence(
         logger: Logger,
-        runtime_tracker: RuntimeTracker,
+        runtime_tracker: MTTRRuntimeTracker,
         sequence_loader: DataLoader,
 ):
     tracker_results = []
@@ -373,6 +378,59 @@ def get_results_of_one_sequence(
         tracker_results.append(_results)
     fps = (len(sequence_loader) - 10) / (time.time() - begin_time)
     return tracker_results, fps
+
+
+def build_mttr_model(config: dict):
+    detr_args = Args()
+    detr_args.backbone = config["BACKBONE"]
+    detr_args.lr_backbone = config["LR"] * config["LR_BACKBONE_SCALE"]
+    detr_args.dilation = config["DILATION"]
+    detr_args.num_classes = config["NUM_CLASSES"]
+    detr_args.device = config["DEVICE"]
+    detr_args.num_queries = config["DETR_NUM_QUERIES"]
+    detr_args.num_feature_levels = config["DETR_NUM_FEATURE_LEVELS"]
+    detr_args.aux_loss = config["DETR_AUX_LOSS"]
+    detr_args.with_box_refine = config["DETR_WITH_BOX_REFINE"]
+    detr_args.two_stage = config["DETR_TWO_STAGE"]
+    detr_args.hidden_dim = config["DETR_HIDDEN_DIM"]
+    detr_args.masks = config["DETR_MASKS"]
+    detr_args.position_embedding = config["DETR_POSITION_EMBEDDING"]
+    detr_args.nheads = config["DETR_NUM_HEADS"]
+    detr_args.enc_layers = config["DETR_ENC_LAYERS"]
+    detr_args.dec_layers = config["DETR_DEC_LAYERS"]
+    detr_args.dim_feedforward = config["DETR_DIM_FEEDFORWARD"]
+    detr_args.dropout = config["DETR_DROPOUT"]
+    detr_args.dec_n_points = config["DETR_DEC_N_POINTS"]
+    detr_args.enc_n_points = config["DETR_ENC_N_POINTS"]
+    detr_args.cls_loss_coef = config["DETR_CLS_LOSS_COEF"]
+    detr_args.bbox_loss_coef = config["DETR_BBOX_LOSS_COEF"]
+    detr_args.giou_loss_coef = config["DETR_GIOU_LOSS_COEF"]
+    detr_args.focal_alpha = config["DETR_FOCAL_ALPHA"]
+    detr_args.set_cost_class = config["DETR_SET_COST_CLASS"]
+    detr_args.set_cost_bbox = config["DETR_SET_COST_BBOX"]
+    detr_args.set_cost_giou = config["DETR_SET_COST_GIOU"]
+    model, _, _ = build_deformable_detr(args=detr_args)
+
+    if config.get("MTTR_MAX_TRACKS", 100) > config.get("DETR_NUM_QUERIES", 300):
+        raise ValueError("MTTR_MAX_TRACKS must be <= DETR_NUM_QUERIES.")
+
+    model.roi_encoder = ROIEncoder(
+        hidden_dim=config.get("DETR_HIDDEN_DIM", 256),
+        pool_size=config.get("MTTR_ROI_POOL_SIZE", 7),
+        num_layers=config.get("MTTR_ROI_NUM_LAYERS", 2),
+        nhead=config.get("MTTR_ROI_NHEAD", 8),
+        dropout=config.get("MTTR_ROI_DROPOUT", 0.0),
+    )
+    model.traj_encoder = TrajEncoder(
+        hidden_dim=config.get("DETR_HIDDEN_DIM", 256),
+        traj_len=config.get("MTTR_TRAJ_LEN", 30),
+        num_layers=config.get("MTTR_TRAJ_NUM_LAYERS", 6),
+        nhead=config.get("MTTR_TRAJ_NHEAD", 8),
+        dim_feedforward=config.get("MTTR_TRAJ_FFN_DIM", 1024),
+        dropout=config.get("MTTR_TRAJ_DROPOUT", 0.0),
+        norm_first=config.get("MTTR_TRAJ_NORM_FIRST", True),
+    )
+    return model
 
 
 def get_eval_metrics_dict(metric_path: str):

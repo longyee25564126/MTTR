@@ -1,4 +1,4 @@
-SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_motip_bft.yaml
+SUPER_CONFIG_PATH: ./configs/r50_deformable_detr_mttr_bft.yaml
 
 SAMPLE_LENGTHS: [1, ]   # Only One Frame Detection
 
@@ -17,4 +17,3 @@ BATCH_SIZE: 2
 ACCUMULATE_STEPS: 1
 
 SAVE_CHECKPOINT_PER_EPOCH: 5
-

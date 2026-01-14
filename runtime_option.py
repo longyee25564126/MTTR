@@ -13,7 +13,7 @@ def runtime_option():
     parser = argparse.ArgumentParser("Network training and evaluation script.", add_help=True)
 
     # Config file.
-    parser.add_argument("--config-path", type=str, default="./configs/r50_deformable_detr_motip_dancetrack.yaml")
+    parser.add_argument("--config-path", type=str, default="./configs/r50_deformable_detr_mttr_dancetrack.yaml")
     parser.add_argument("--super-config-path", type=str)
 
     # About system.
@@ -109,5 +109,10 @@ def runtime_option():
     parser.add_argument("--save-checkpoint-per-epoch", type=int)
 
     parser.add_argument("--use-previous-checkpoint", type=str)
+
+    # Debug / sanity:
+    parser.add_argument("--debug-sanity", type=str)
+    parser.add_argument("--debug-assert", type=str)
+    parser.add_argument("--debug-sanity-iters", type=int)
 
     return parser.parse_args()

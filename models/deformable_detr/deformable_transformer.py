@@ -123,7 +123,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, track_queries: torch.Tensor | None = None):
         assert self.two_stage or query_embed is not None
 
         # prepare input for encoder
@@ -171,8 +171,18 @@ class DeformableTransformer(nn.Module):
             query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
         else:
             query_embed, tgt = torch.split(query_embed, c, dim=1)
-            query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
-            tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
+            query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1).clone()
+            tgt = tgt.unsqueeze(0).expand(bs, -1, -1).clone()
+            if track_queries is not None:
+                if track_queries.shape[0] != bs or track_queries.shape[2] != c:
+                    raise ValueError("track_queries must be (B, K, C) with C == hidden_dim.")
+                k = track_queries.shape[1]
+                if k > 0:
+                    if k > query_embed.shape[1]:
+                        raise ValueError("track_queries K must be <= num_queries.")
+                    track_queries = track_queries.to(device=tgt.device, dtype=tgt.dtype)
+                    tgt[:, :k, :] = track_queries
+                    query_embed[:, :k, :] = track_queries
             reference_points = self.reference_points(query_embed).sigmoid()
             init_reference_out = reference_points
 
@@ -392,5 +402,4 @@ def build_deforamble_transformer(args):
         enc_n_points=args.enc_n_points,
         two_stage=args.two_stage,
         two_stage_num_proposals=args.num_queries)
-
 
