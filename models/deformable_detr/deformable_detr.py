@@ -114,7 +114,15 @@ class DeformableDETR(nn.Module):
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
-    def forward(self, samples: NestedTensor, track_queries: torch.Tensor | None = None):
+        self.track_class_embed = copy.deepcopy(self.class_embed)
+        self.track_bbox_embed = copy.deepcopy(self.bbox_embed)
+
+    def forward(
+        self,
+        samples: NestedTensor,
+        track_queries: torch.Tensor | None = None,
+        num_track_slots: int | None = None,
+    ):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -161,6 +169,15 @@ class DeformableDETR(nn.Module):
             srcs, masks, pos, query_embeds, track_queries=track_queries
         )
 
+        if num_track_slots is None:
+            if track_queries is not None:
+                num_track_slots = int(track_queries.shape[1])
+            else:
+                num_track_slots = 0
+        if num_track_slots < 0:
+            num_track_slots = 0
+        num_track_slots = min(num_track_slots, hs.shape[2])
+
         outputs_classes = []
         outputs_coords = []
         for lvl in range(hs.shape[0]):
@@ -169,14 +186,29 @@ class DeformableDETR(nn.Module):
             else:
                 reference = inter_references[lvl - 1]
             reference = inverse_sigmoid(reference)
-            outputs_class = self.class_embed[lvl](hs[lvl])
-            tmp = self.bbox_embed[lvl](hs[lvl])
-            if reference.shape[-1] == 4:
-                tmp += reference
+            k = num_track_slots
+            hs_track = hs[lvl][:, :k, :]
+            hs_det = hs[lvl][:, k:, :]
+            ref_track = reference[:, :k, :]
+            ref_det = reference[:, k:, :]
+            track_logits = self.track_class_embed[lvl](hs_track)
+            track_tmp = self.track_bbox_embed[lvl](hs_track)
+            if ref_track.shape[-1] == 4:
+                track_tmp += ref_track
             else:
-                assert reference.shape[-1] == 2
-                tmp[..., :2] += reference
-            outputs_coord = tmp.sigmoid()
+                assert ref_track.shape[-1] == 2
+                track_tmp[..., :2] += ref_track
+            track_boxes = track_tmp.sigmoid()
+            det_logits = self.class_embed[lvl](hs_det)
+            det_tmp = self.bbox_embed[lvl](hs_det)
+            if ref_det.shape[-1] == 4:
+                det_tmp += ref_det
+            else:
+                assert ref_det.shape[-1] == 2
+                det_tmp[..., :2] += ref_det
+            det_boxes = det_tmp.sigmoid()
+            outputs_class = torch.cat([track_logits, det_logits], dim=1)
+            outputs_coord = torch.cat([track_boxes, det_boxes], dim=1)
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
         outputs_class = torch.stack(outputs_classes)

@@ -134,6 +134,7 @@ def load_detr_pretrain(model: nn.Module, pretrain_path: str, num_classes: int | 
     for k, v in detr_state_dict.items():
         assert k in model_state_dict, f"DETR parameter key '{k}' should in the model."
         model_state_dict[k] = v
+    _maybe_init_track_heads(model_state_dict, model)
     # Load the model state dict.
     model.load_state_dict(state_dict=model_state_dict, strict=True)
     return
@@ -162,6 +163,7 @@ def load_checkpoint(model, path, states=None, optimizer=None, scheduler=None):
         load_detr_pretrain(model=model, pretrain_path=path, num_classes=None)
         return
     else:
+        _maybe_init_track_heads(model_state, model)
         model.load_state_dict(model_state)
 
     if optimizer is not None:
@@ -175,6 +177,29 @@ def load_checkpoint(model, path, states=None, optimizer=None, scheduler=None):
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
+
+
+
+
+def _maybe_init_track_heads(model_state: dict, model: nn.Module):
+    model_state_dict = model.state_dict()
+    track_keys = [k for k in model_state_dict.keys() if k.startswith("track_class_embed") or k.startswith("track_bbox_embed")]
+    if not track_keys:
+        return
+    missing = [k for k in track_keys if k not in model_state]
+    if not missing:
+        return
+    for k in missing:
+        if k.startswith("track_class_embed"):
+            det_k = k.replace("track_class_embed", "class_embed", 1)
+        elif k.startswith("track_bbox_embed"):
+            det_k = k.replace("track_bbox_embed", "bbox_embed", 1)
+        else:
+            continue
+        if det_k in model_state:
+            model_state[k] = model_state[det_k].clone()
+        else:
+            model_state[k] = model_state_dict[k].clone()
 
 
 def get_model(model):

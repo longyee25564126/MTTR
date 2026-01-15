@@ -333,6 +333,7 @@ def train_one_epoch(
     traj_len = config.get("MTTR_TRAJ_LEN", 30)
     max_miss = config.get("MTTR_MAX_MISS", 30)
     teacher_forcing = config.get("MTTR_TEACHER_FORCING", True)
+    det_loss_weight = float(config.get("MTTR_DET_LOSS_WEIGHT", 1.0))
 
     debug_sanity = config.get("DEBUG_SANITY", False)
     debug_assert = config.get("DEBUG_ASSERT", False)
@@ -533,7 +534,7 @@ def train_one_epoch(
 
         train_frame = NestedTensor(images.tensors[:, t], images.mask[:, t])
         with accelerator.autocast():
-            out_t = model(samples=train_frame, track_queries=track_queries_batch)
+            out_t = model(samples=train_frame, track_queries=track_queries_batch, num_track_slots=max_tracks)
         pred_logits = out_t["pred_logits"].float()
         pred_boxes = out_t["pred_boxes"].float()
 
@@ -542,9 +543,12 @@ def train_one_epoch(
 
         targets_track = []
         indices_track = []
+        targets_det = []
         total_boxes = 0
         num_pos_per_b = [0 for _ in range(_B)]
         num_gt_per_b = [0 for _ in range(_B)]
+        covered_gt_per_b = [0 for _ in range(_B)]
+        uncovered_gt_per_b = [0 for _ in range(_B)]
         for b in range(_B):
             masks_label, annidx_label = _build_label_lookup(
                 ann=annotations[b][t],
@@ -573,8 +577,10 @@ def train_one_epoch(
             if debug_assert:
                 if ann_bbox.ndim != 2 or ann_bbox.shape[1] != 4:
                     raise AssertionError(f"ann_bbox shape invalid: {ann_bbox.shape}")
-            num_gt_per_b[b] = int(ann_bbox.shape[0])
+            num_gt = int(ann_bbox.shape[0])
+            num_gt_per_b[b] = num_gt
             pos_mask = (~masks_label) & (annidx_label >= 0)
+            covered_gt = set()
             src_idx = []
             tgt_labels = []
             tgt_boxes = []
@@ -589,6 +595,7 @@ def train_one_epoch(
                             raise AssertionError(
                                 f"ann_idx {ann_idx} out of range [0, {ann_bbox.shape[0]}) for label {label}"
                             )
+                    covered_gt.add(ann_idx)
                     src_idx.append(i)
                     tgt_labels.append(ann_category[ann_idx])
                     tgt_boxes.append(ann_bbox[ann_idx])
@@ -610,8 +617,50 @@ def train_one_epoch(
                 tgt_idx_tensor = torch.arange(len(src_idx), dtype=torch.int64, device=device)
                 indices_track.append((src_idx_tensor, tgt_idx_tensor))
                 total_boxes += len(src_idx)
+            covered_gt_per_b[b] = len(covered_gt)
+            uncovered = [i for i in range(num_gt) if i not in covered_gt]
+            uncovered_gt_per_b[b] = len(uncovered)
+            if len(uncovered) == 0:
+                targets_det.append({
+                    "labels": ann_category.new_zeros((0,), dtype=torch.int64),
+                    "boxes": ann_bbox.new_zeros((0, 4)),
+                })
+            else:
+                uncovered_idx = torch.as_tensor(uncovered, device=device, dtype=torch.int64)
+                targets_det.append({
+                    "labels": ann_category[uncovered_idx],
+                    "boxes": ann_bbox[uncovered_idx],
+                })
 
         num_boxes = max(1, total_boxes)
+        det_logits = pred_logits[:, max_tracks:, :]
+        det_boxes = pred_boxes[:, max_tracks:, :]
+        det_total_boxes = sum(int(t["labels"].numel()) for t in targets_det)
+        num_boxes_det = max(1, det_total_boxes)
+
+        def _match_det(pred_logits, pred_boxes, targets):
+            indices = []
+            if pred_logits.shape[1] == 0:
+                for _ in range(len(targets)):
+                    empty = torch.zeros((0,), dtype=torch.int64, device=pred_logits.device)
+                    indices.append((empty, empty))
+                return indices
+            for b in range(len(targets)):
+                if targets[b]["labels"].numel() == 0:
+                    empty = torch.zeros((0,), dtype=torch.int64, device=pred_logits.device)
+                    indices.append((empty, empty))
+                    continue
+                outputs_b = {
+                    "pred_logits": pred_logits[b:b+1],
+                    "pred_boxes": pred_boxes[b:b+1],
+                }
+                idx_b = detr_criterion.matcher(outputs_b, [targets[b]])[0]
+                indices.append((idx_b[0].to(pred_logits.device), idx_b[1].to(pred_logits.device)))
+            return indices
+
+        det_indices = _match_det(det_logits, det_boxes, targets_det)
+        det_matched_per_b = [int(idx[0].numel()) for idx in det_indices]
+        det_matched_total = sum(det_matched_per_b)
 
         def _compute_track_losses(pred_logits, pred_boxes, add_suffix: str | None = None):
             pred_logits = pred_logits.float()
@@ -644,32 +693,99 @@ def train_one_epoch(
                 return losses
             return {f"{k}_{add_suffix}": v for k, v in losses.items()}
 
-        loss_dict = _compute_track_losses(logits_track, boxes_track)
+        def _compute_det_losses(pred_logits, pred_boxes, indices, targets, num_boxes, add_suffix: str | None = None):
+            pred_logits = pred_logits.float()
+            pred_boxes = pred_boxes.float()
+            outputs_det = {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
+            losses = detr_criterion.loss_labels(
+                outputs_det,
+                targets,
+                indices,
+                num_boxes,
+                log=True,
+            )
+            if det_total_boxes > 0:
+                losses.update(detr_criterion.loss_boxes(
+                    outputs_det,
+                    targets,
+                    indices,
+                    num_boxes,
+                ))
+            else:
+                zero = pred_boxes.new_tensor(0.0)
+                losses.update({"loss_bbox": zero, "loss_giou": zero})
+            losses.update(detr_criterion.loss_cardinality(
+                outputs_det,
+                targets,
+                indices,
+                num_boxes,
+            ))
+            if add_suffix is None:
+                return losses
+            return {f"{k}_{add_suffix}": v for k, v in losses.items()}
+
+        loss_track_dict = _compute_track_losses(logits_track, boxes_track)
+        loss_det_dict = _compute_det_losses(det_logits, det_boxes, det_indices, targets_det, num_boxes_det)
+        loss_dict = dict(loss_track_dict)
+        for k, v in loss_det_dict.items():
+            loss_dict[f"{k}_det"] = v
 
         if "aux_outputs" in out_t:
             for i, aux in enumerate(out_t["aux_outputs"]):
                 aux_logits = aux["pred_logits"][:, :max_tracks, :]
                 aux_boxes = aux["pred_boxes"][:, :max_tracks, :]
-                loss_dict.update(_compute_track_losses(aux_logits, aux_boxes, add_suffix=str(i)))
+                aux_track_losses = _compute_track_losses(aux_logits, aux_boxes, add_suffix=str(i))
+                loss_track_dict.update(aux_track_losses)
+                loss_dict.update(aux_track_losses)
+                aux_det_logits = aux["pred_logits"][:, max_tracks:, :]
+                aux_det_boxes = aux["pred_boxes"][:, max_tracks:, :]
+                aux_det_indices = _match_det(aux_det_logits, aux_det_boxes, targets_det)
+                aux_det_losses = _compute_det_losses(
+                    aux_det_logits,
+                    aux_det_boxes,
+                    aux_det_indices,
+                    targets_det,
+                    num_boxes_det,
+                    add_suffix=str(i),
+                )
+                loss_det_dict.update(aux_det_losses)
+                for k, v in aux_det_losses.items():
+                    loss_dict[f"{k}_det"] = v
 
         with accelerator.autocast():
-            loss = sum(
-                loss_dict[k] * detr_weight_dict[k]
-                for k in loss_dict.keys()
+            loss_track_total = sum(
+                loss_track_dict[k] * detr_weight_dict[k]
+                for k in loss_track_dict.keys()
                 if k in detr_weight_dict
             )
+            loss_det_total = sum(
+                loss_det_dict[k] * detr_weight_dict[k]
+                for k in loss_det_dict.keys()
+                if k in detr_weight_dict
+            )
+            loss = loss_track_total + det_loss_weight * loss_det_total
             loss_total_value = loss.item()
             if debug_log_enabled:
-                loss_ce_val = loss_dict.get("loss_ce", loss.new_tensor(0.0)).item()
-                loss_bbox_val = loss_dict.get("loss_bbox", loss.new_tensor(0.0)).item()
-                loss_giou_val = loss_dict.get("loss_giou", loss.new_tensor(0.0)).item()
+                loss_track_ce = loss_track_dict.get("loss_ce", loss.new_tensor(0.0)).item()
+                loss_track_bbox = loss_track_dict.get("loss_bbox", loss.new_tensor(0.0)).item()
+                loss_track_giou = loss_track_dict.get("loss_giou", loss.new_tensor(0.0)).item()
+                loss_det_ce = loss_det_dict.get("loss_ce", loss.new_tensor(0.0)).item()
+                loss_det_bbox = loss_det_dict.get("loss_bbox", loss.new_tensor(0.0)).item()
+                loss_det_giou = loss_det_dict.get("loss_giou", loss.new_tensor(0.0)).item()
+                covered_total = sum(covered_gt_per_b)
+                uncovered_total = sum(uncovered_gt_per_b)
                 logger.info(
                     log=(
                         f"[DEBUG_SANITY] step={step} t={t} g={group_indices} "
-                        f"K={k_per_b} num_pos={num_pos_per_b} num_gt={num_gt_per_b} "
-                        f"num_pos_total={total_boxes} "
-                        f"loss_ce={loss_ce_val:.4f} loss_bbox={loss_bbox_val:.4f} "
-                        f"loss_giou={loss_giou_val:.4f} loss_total={loss_total_value:.4f} "
+                        f"K={k_per_b} track_pos={num_pos_per_b} num_gt={num_gt_per_b} "
+                        f"covered_gt={covered_gt_per_b} uncovered_gt={uncovered_gt_per_b} "
+                        f"det_matched={det_matched_per_b} "
+                        f"track_pos_total={total_boxes} covered_total={covered_total} "
+                        f"uncovered_total={uncovered_total} det_matched_total={det_matched_total} "
+                        f"loss_track_ce={loss_track_ce:.4f} loss_track_bbox={loss_track_bbox:.4f} "
+                        f"loss_track_giou={loss_track_giou:.4f} "
+                        f"loss_det_ce={loss_det_ce:.4f} loss_det_bbox={loss_det_bbox:.4f} "
+                        f"loss_det_giou={loss_det_giou:.4f} loss_total={loss_total_value:.4f} "
                         f"pred_logits_dtype={pred_logits.dtype} pred_boxes_dtype={pred_boxes.dtype}"
                     )
                 )
@@ -817,6 +933,15 @@ def load_detr_pretrain_for_detr(model, pretrain_path: str, num_classes: int | No
             transfer_state[k] = v
 
     model_state_dict.update(transfer_state)
+    for k in list(model_state_dict.keys()):
+        if k.startswith("track_class_embed"):
+            det_k = k.replace("track_class_embed", "class_embed", 1)
+            if det_k in model_state_dict:
+                model_state_dict[k] = model_state_dict[det_k].clone()
+        elif k.startswith("track_bbox_embed"):
+            det_k = k.replace("track_bbox_embed", "bbox_embed", 1)
+            if det_k in model_state_dict:
+                model_state_dict[k] = model_state_dict[det_k].clone()
     model.load_state_dict(state_dict=model_state_dict, strict=True)
     return
 

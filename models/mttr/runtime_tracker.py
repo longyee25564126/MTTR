@@ -87,7 +87,7 @@ class MTTRRuntimeTracker:
                 dtype=self.dtype,
             )
 
-        out = self.model(samples=image, track_queries=track_queries_batch)
+        out = self.model(samples=image, track_queries=track_queries_batch, num_track_slots=self.max_tracks)
         logits = out["pred_logits"][0]
         boxes = out["pred_boxes"][0]
         scores = logits.sigmoid()
